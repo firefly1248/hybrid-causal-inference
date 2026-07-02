@@ -1,0 +1,13 @@
+# Tested with Python 3.9
+pandas==2.3.3
+numpy==2.0.2
+scikit-learn==1.6.1
+scipy==1.13.1
+statsmodels==0.14.6
+matplotlib==3.9.4
+seaborn==0.13.2
+catboost==1.2.10
+doubleml==0.10.1
+econml==0.16.0
+# Only needed to regenerate the executed notebook from the .py source:
+jupytext==1.19.4
