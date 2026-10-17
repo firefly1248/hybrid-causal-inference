@@ -3,40 +3,44 @@
 Estimating, from observational EPA data (~50k vehicles, model years 1984-2027), how
 much fuel a hybrid powertrain actually saves once you account for the fact that
 hybrids are not random - they cluster in specific segments, engine sizes, brands, and
-model years. The project applies and cross-checks nine causal-inference estimators
+model years. The project applies and cross-checks ten causal-inference estimators
 plus a full robustness suite.
 
 ## TL;DR
 
-- A naive comparison says hybrids get **+9 MPG (+42%)**. That is the *MPG illusion*:
+- A naive comparison says hybrids get **+8.8 MPG (+42%)**. That is the *MPG illusion*:
   MPG is the reciprocal of consumption, so gaps at the high end are exaggerated.
 - Measured correctly (gallons per 100 miles) and adjusted for confounders, comparable
-  hybrids use **~0.85-0.90 fewer gal/100mi, about a 17-18% reduction in fuel** -
-  roughly **130 gal and 1.1 t CO2 saved per year** at 15k mi/yr.
-- Every doubly-robust estimator (AIPW, DML, DoubleML IRM, overlap weights) lands in
-  the same range; within-model twins give -0.94. The result survives placebo,
-  negative-control, and E-value sensitivity checks (an unmeasured confounder would
-  need RR ~3.2 with both treatment and outcome to explain it away).
+  hybrids use **~0.83-0.87 fewer gal/100mi, about 17-19% less fuel** -
+  roughly **125 gal and 1.1 t CO2 saved per year** at 15k mi/yr.
+- IPW, AIPW, DML, DoubleML IRM, PSM and overlap weights all land in that range;
+  within-model twins give -1.03. Placebo, random-common-cause and subset checks pass,
+  and an unmeasured confounder would need RR ~3.2 with both treatment and outcome to
+  explain the effect away. The negative-control outcome does not pass (see Caveats).
 
 ![Estimator comparison](05_estimator_comparison.png)
 
-## Results (overlap population, effect on fuel use)
+## Results
 
-| Estimator | ATE (gal/100mi) | % fuel | 95% CI |
-|---|---|---|---|
-| Naive (unadjusted, full sample) | -1.29 | -26% | - |
-| OLS adjustment | -0.73 | -15% | [-0.81, -0.64] |
-| Propensity score matching (ATT) | -0.78 | -16% | [-1.00, -0.60] |
-| Inverse probability weighting | -0.87 | -17% | [-1.18, -0.54] |
-| AIPW (cross-fitted, doubly robust) | -0.90 | -18% | [-1.00, -0.79] |
-| Double ML (CatBoost, cross-fit) | -0.85 | -17% | [-0.93, -0.78] |
-| Within-model twins (Camry vs Camry Hybrid) | -0.94 | -22% | [-1.05, -0.83] |
-| Overlap weights (ATO) | -0.89 | -18% | [-1.09, -0.69] |
-| DoubleML IRM (library) | -0.88 | -18% | [-0.96, -0.80] |
+Effect on fuel use, gal/100mi. Each % is relative to E[Y(0)] of that row's target
+population.
 
-The doubly-robust estimators cluster tightly at **-0.85 to -0.90 gal/100mi**. An EconML
-causal forest agrees on sign but is imprecise here (wide CI under low treatment
-prevalence), so it is reported for its point estimate and heterogeneity only.
+| Estimator | Estimand | Effect | % fuel | 95% CI |
+|---|---|---|---|---|
+| Naive (unadjusted, full sample) | - | -1.29 | -26% | - |
+| OLS adjustment | variance-weighted | -0.73 | -16% | [-0.82, -0.64] |
+| Propensity score matching | ATT | -0.86 | -19% | [-1.08, -0.66] |
+| Inverse probability weighting | overlap ATE | -0.87 | -18% | [-1.20, -0.56] |
+| AIPW (cross-fitted, doubly robust) | overlap ATE | -0.87 | -18% | [-0.95, -0.79] |
+| Double ML (partial linear, CatBoost) | variance-weighted | -0.83 | -18% | [-0.91, -0.76] |
+| Within-model twins (Camry vs Camry Hybrid) | ATT | -1.03 | -25% | [-1.15, -0.92] |
+| Mahalanobis + PS caliper matching | ATT | -0.71 | -16% | [-0.81, -0.59] |
+| Overlap weights | ATO | -0.86 | -19% | [-1.05, -0.66] |
+| DoubleML IRM (library) | overlap ATE | -0.85 | -17% | [-0.93, -0.76] |
+| EconML causal forest | overlap ATE | -0.98 | -20% | [-1.02, -0.94]* |
+
+\* Row-level CI, not cluster-robust, so too narrow. Variance-weighted means weights
+e(1-e), close to the ATO.
 
 ## Method
 
@@ -46,24 +50,26 @@ size class, drive type, manufacturer. Post-treatment variables (CO2, fuel cost, 
 are deliberately excluded.
 
 Estimators: naive difference, OLS regression adjustment, propensity-score matching,
-IPW (Hajek), AIPW, Double ML, within-model exact matching, overlap weights (ATO),
-DoubleML IRM, EconML causal forest for heterogeneous effects.
+IPW (Hajek), AIPW, Double ML, within-model exact matching, Mahalanobis matching
+within a PS caliper, overlap weights (ATO),
+DoubleML IRM, EconML causal forest. Heterogeneous effects come from a cross-fitted
+T-learner.
 
 What makes the estimates trustworthy:
 
 - **Right outcome scale** - gallons/100mi, not MPG (Larrick & Soll 2008).
-- **Honest uncertainty** - observations de-duplicated and inference clustered by
-  nameplate (the same car recurs across trims/years and is not independent);
-  library IRM uses cluster-robust inference.
+- **Clustered uncertainty** - observations de-duplicated and inference clustered by
+  nameplate (the same car recurs across trims/years and is not independent). Every
+  CI except the causal forest's is cluster-robust.
 - **No leakage** - the propensity score and every nuisance model are cross-fitted with
   GroupKFold grouped by nameplate, so replicate trims never straddle folds.
 - **Explicit estimand** - hybrids and gasoline vehicles overlap only in part of the
   covariate space, so the target is the effect on the overlap (common-support)
   population; matching rows target the ATT. A whole-fleet ATE is not identified.
 - **Falsification** - placebo treatment (effect vanishes), random common cause (no
-  change), negative-control outcome (passenger volume), data-subset stability.
-- **Sensitivity** - Rosenbaum bounds (per-nameplate; robust to Gamma up to ~10) and an
-  E-value of ~3.2.
+  change), data-subset stability. The negative-control outcome fails (see Caveats).
+- **Sensitivity** - Rosenbaum bounds (per-nameplate; significant up to Gamma = 10, the
+  largest tested) and an E-value of ~3.2.
 
 ## Repository
 
@@ -84,7 +90,7 @@ python hybrid_causal_inference.py          # runs everything, writes the .png fi
 jupytext --to notebook --execute hybrid_causal_inference.py -o hybrid_causal_inference.ipynb
 ```
 
-Runtime is a few minutes on a laptop. All randomness is seeded, so results reproduce.
+Runtime is about 1-2 minutes on a laptop. All randomness is seeded, so results reproduce.
 
 ## Data provenance
 
@@ -105,15 +111,22 @@ Runtime is a few minutes on a laptop. All randomness is seeded, so results repro
 - The outcome is EPA *rated* fuel economy. Real-world hybrid advantage is somewhat
   smaller because EPA test cycles favor hybrids (Consumer Reports); the code shows an
   illustrative rated-vs-real-world bracket.
-- **Mixed treatment**: on recent model years EPA's "Hybrid" flag also covers 48V mild
-  hybrids (e.g. BMW M440i, Land Rover MHEV, Ram eTorque), which save far less fuel and
-  dilute the estimate - part of why the effect is smaller here than on an older MY2015
-  snapshot (~-1.1 to -1.2). Splitting full vs mild HEVs is left as future work.
+- **Mixed treatment**: EPA's "Hybrid" flag also covers 48V mild hybrids (e.g. BMW
+  M440i, Land Rover MHEV, Ram eTorque); 43% of hybrid rows are tagged "Mild Hybrid" in
+  `eng_dscr`. They save far less fuel and dilute the estimate - part of why the effect
+  is smaller here than on an older MY2015 snapshot (~-1.1 to -1.2). Splitting full vs
+  mild HEVs is left as future work.
+- **Negative control fails**: hybrids show +1.5 cu ft passenger volume (z = 3.5;
+  0.18 SD vs 0.70 SD for the main effect). Residual body/packaging confounding is
+  possible. EPA car classes are defined by interior volume, so this control is weak.
+- **Within-model twins** must match on nameplate, drive, model year and forced
+  induction, so only 373 hybrids from 53 nameplates have one. That estimate covers
+  hybrids with a gasoline twin, and its bootstrap CI treats each twin as fixed.
 - No sales weighting: a rare trim counts the same as a bestseller.
 
 ## Future work
 
-- Separate full HEVs from 48V mild hybrids (via `eng_dscr` / `evMotor`).
+- Separate full HEVs from mild hybrids (via `eng_dscr` / `evMotor`).
 - Join sales/registration weights (sales-weighted estimand), curb weight and MSRP
   (stronger selection confounders), and real-world fuel economy (rated -> real outcome).
 
