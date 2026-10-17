@@ -76,7 +76,8 @@ What makes the estimates trustworthy:
 ```
 hybrid_causal_inference.py      analysis source (jupytext percent format)
 hybrid_causal_inference.ipynb   executed notebook with outputs and figures
-vehicles.csv                    EPA Fuel Economy snapshot (see Data provenance)
+vehicles.csv                    EPA Fuel Economy snapshot
+DATASET.md                      data source, fields, treatment/control definitions
 01..07_*.png                    generated figures
 requirements.txt
 ```
@@ -94,15 +95,12 @@ Runtime is about 1-2 minutes on a laptop. All randomness is seeded, so results r
 
 ## Data provenance
 
-- **Source**: US EPA / DOE Fuel Economy dataset, `fueleconomy.gov/feg/epadata/vehicles.csv`.
-- **Snapshot**: downloaded 2026-07-02 (server `last-modified` 2026-06-16),
-  49,995 rows, model years 1984-2027. MD5 `1d4a8e48f98e7f3c685e4d77e585f0b9`.
-  The CSV is committed so the analysis is fully reproducible against a frozen file.
-- **Analysis window**: MY1998-2026. MY2027 rows are early-certified upcoming models
-  (that year is incomplete), so they are dropped.
-- **Control purity**: `atvType` is NaN not only for gasoline cars but also for diesels
-  and CNG vehicles, so the control group is defined by `fuelType1` (gasoline), not by
-  `atvType` alone.
+US EPA / DOE Fuel Economy dataset, `fueleconomy.gov/feg/epadata/vehicles.csv`,
+downloaded 2026-07-02 (49,995 rows, model years 1984-2027, MD5
+`1d4a8e48f98e7f3c685e4d77e585f0b9`). The CSV is committed so the analysis runs against
+a frozen file. Analysis window is MY1998-2026; MY2027 rows are incomplete early
+certifications. Fields, treatment/control definitions, exclusions and data checks are in
+[DATASET.md](DATASET.md).
 
 ## Caveats
 
