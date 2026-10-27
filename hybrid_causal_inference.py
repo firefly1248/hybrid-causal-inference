@@ -60,7 +60,7 @@ from scipy import stats
 from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import GroupKFold, cross_val_predict
 from catboost import CatBoostRegressor, CatBoostClassifier
-from doubleml import DoubleMLClusterData, DoubleMLIRM
+from doubleml import DoubleMLClusterData, DoubleMLIRM, DoubleMLPLR
 from econml.dml import CausalForestDML
 
 # Hide library FutureWarnings only.
@@ -92,9 +92,9 @@ print(f"Year range: {df_raw['year'].min()} - {df_raw['year'].max()}")
 # ## 2. Define treatment and filter data
 #
 # - **Treatment group**: `atvType == 'Hybrid'` (non-plug-in HEV). Note: on recent
-#   model years EPA's "Hybrid" flag also covers 48V mild hybrids (e.g. BMW M440i,
-#   Land Rover MHEV, Ram eTorque) that save far less fuel and dilute the treatment
-#   (see takeaway 7).
+#   model years EPA's "Hybrid" flag also covers mild hybrids, mostly 48V (e.g. BMW
+#   M440i, Land Rover MHEV, Ram eTorque), that save far less fuel and dilute the
+#   treatment (see section 25).
 # - **Control group**: Pure gasoline vehicles (`atvType` is NaN, gasoline fuel)
 # - We exclude EVs, PHEVs, diesels, FFVs, CNG, FCVs to keep a clean comparison
 
@@ -323,18 +323,24 @@ print("  Both are still BIASED: hybrids are midsize sedans, not pickups/SUVs.")
 # overfit in-sample - the same reason we cross-fit the AIPW/DML nuisances.
 
 # %%
-ps = cross_val_predict(
-    cb_clf(), Xd, T, groups=cluster_id,
-    cv=GroupKFold(n_splits=5, shuffle=True, random_state=42),
-    method='predict_proba')[:, 1]
+def crossfit_ps(X, t, clu, seed=42):
+    return cross_val_predict(
+        cb_clf(seed), X, t, groups=clu,
+        cv=GroupKFold(n_splits=5, shuffle=True, random_state=seed),
+        method='predict_proba')[:, 1]
+
+
+def common_support(p, t):
+    return max(p[t == 1].min(), p[t == 0].min()), min(p[t == 1].max(), p[t == 0].max())
+
+
+ps = crossfit_ps(Xd, T, cluster_id)
 
 print("Propensity score (cross-fitted GBM) distribution:")
 print(f"  Gasoline: mean={ps[T==0].mean():.4f}, median={np.median(ps[T==0]):.4f}")
 print(f"  Hybrid:   mean={ps[T==1].mean():.4f}, median={np.median(ps[T==1]):.4f}")
 
-# Common support (overlap)
-ps_min = max(ps[T == 1].min(), ps[T == 0].min())
-ps_max = min(ps[T == 1].max(), ps[T == 0].max())
+ps_min, ps_max = common_support(ps, T)
 ov = (ps >= ps_min) & (ps <= ps_max)
 print(f"\nCommon support: {ov.sum():,} / {len(ps):,} vehicles retained "
       f"({(T[ov]==1).sum():,} hybrid, {(T[ov]==0).sum():,} gasoline)")
@@ -351,8 +357,8 @@ eps = 0.01   # propensity clip for IPW / AIPW
 
 # % fuel change divides each effect by E[Y(0)] of its own target population,
 # estimated as a weighted mean of overlap-sample control outcomes.
-def control_mean(w):
-    return np.average(Y_ov[T_ov == 0], weights=w[T_ov == 0])
+def control_mean(w, y=Y_ov, t=T_ov):
+    return np.average(y[t == 0], weights=w[t == 0])
 
 
 base_ate = control_mean(1 / (1 - np.clip(ps_ov, eps, 1 - eps)))   # IPW, AIPW, IRM, forest
@@ -560,34 +566,36 @@ print(f"  Total package effect (drop displ/cylinders/turbo): {ate_pkg:+.3f} gal/
 # chosen twin as fixed, so it is slightly optimistic.
 
 # %%
-hybrid_df = df_clean[df_clean['is_hybrid'] == 1]
-gas_df = df_clean[df_clean['is_hybrid'] == 0]
+def within_model_pairs(hybrid_df, gas_df):
+    pairs = []
+    for _, row in hybrid_df.iterrows():
+        # Exact base nameplate: a substring match would pair Camry Hybrid with Camry Solara.
+        gm = gas_df[
+            (gas_df['make'] == row['make']) &
+            (gas_df['base_model'] == row['base_model']) &
+            (gas_df['drive_simple'] == row['drive_simple']) &
+            (gas_df['year'] == row['year']) &
+            (gas_df['turbo'] == row['turbo'])
+        ].copy()
+        if len(gm) > 0:
+            gm['displ_diff'] = (gm['displ'] - row['displ']).abs()
+            best = gm.sort_values(['displ_diff', 'model']).iloc[0]   # model: deterministic tie-break
+            pairs.append({
+                'cluster_key': row['cluster_key'],
+                'make': row['make'], 'model_hybrid': row['model'],
+                'model_gas': best['model'], 'year': row['year'],
+                'mpg_hybrid': row['comb08'], 'mpg_gas': best['comb08'],
+                'gp_hybrid': 100.0 / row['comb08'], 'gp_gas': 100.0 / best['comb08'],
+                'gpc_hybrid': 100.0 / row['city08'], 'gpc_gas': 100.0 / best['city08'],
+                'gph_hybrid': 100.0 / row['highway08'], 'gph_gas': 100.0 / best['highway08'],
+            })
+    out = pd.DataFrame(pairs)
+    out['gp_diff'] = out['gp_hybrid'] - out['gp_gas']       # <0 = saves fuel
+    return out
 
-pairs = []
-for _, row in hybrid_df.iterrows():
-    # Exact base nameplate, not a substring: substrings paired Camry Hybrid with Camry Solara.
-    gm = gas_df[
-        (gas_df['make'] == row['make']) &
-        (gas_df['base_model'] == row['base_model']) &
-        (gas_df['drive_simple'] == row['drive_simple']) &
-        (gas_df['year'] == row['year']) &
-        (gas_df['turbo'] == row['turbo'])
-    ].copy()
-    if len(gm) > 0:
-        gm['displ_diff'] = (gm['displ'] - row['displ']).abs()
-        best = gm.sort_values(['displ_diff', 'model']).iloc[0]   # model: deterministic tie-break
-        pairs.append({
-            'cluster_key': row['cluster_key'],
-            'make': row['make'], 'model_hybrid': row['model'],
-            'model_gas': best['model'], 'year': row['year'],
-            'mpg_hybrid': row['comb08'], 'mpg_gas': best['comb08'],
-            'gp_hybrid': 100.0 / row['comb08'], 'gp_gas': 100.0 / best['comb08'],
-            'gpc_hybrid': 100.0 / row['city08'], 'gpc_gas': 100.0 / best['city08'],
-            'gph_hybrid': 100.0 / row['highway08'], 'gph_gas': 100.0 / best['highway08'],
-        })
 
-pairs_df = pd.DataFrame(pairs)
-pairs_df['gp_diff'] = pairs_df['gp_hybrid'] - pairs_df['gp_gas']       # <0 = saves fuel
+pairs_df = within_model_pairs(df_clean[df_clean['is_hybrid'] == 1],
+                              df_clean[df_clean['is_hybrid'] == 0])
 pairs_df['gp_pct'] = pairs_df['gp_diff'] / pairs_df['gp_gas'] * 100
 pairs_df['city_diff'] = pairs_df['gpc_hybrid'] - pairs_df['gpc_gas']
 pairs_df['hwy_diff'] = pairs_df['gph_hybrid'] - pairs_df['gph_gas']
@@ -780,7 +788,7 @@ def rosenbaum_bounds(diff, gammas):
 # One mean saving per nameplate: pairs within a nameplate (years, drivetrains) are
 # not independent. Saving > 0 means the hybrid uses less fuel.
 saving = -pairs_df.groupby('cluster_key')['gp_diff'].mean().values
-gammas = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+gammas = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
 bounds = rosenbaum_bounds(saving, gammas)
 print(f"Rosenbaum Sensitivity Analysis (within-model, {len(saving)} nameplates):")
 print("  Gamma = odds ratio of unmeasured confounding\n")
@@ -1114,6 +1122,209 @@ plt.savefig('07_extended_comparison.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 # %% [markdown]
+# ## 25. Full vs mild hybrids
+#
+# EPA's "Hybrid" flag covers two different products. **Full HEVs** (Prius, Camry
+# Hybrid, RAV4 Hybrid) have a high-voltage pack, and many can drive on electric
+# power. **Mild hybrids** (BMW M440i, Mercedes EQ Boost, Ram eTorque) add a
+# starter-generator, mostly 48V, to a conventional engine. We estimate each type
+# against gasoline, dropping the other type; each gets its own PS and common
+# support, so the gasoline comparison sets differ.
+#
+# Mild = EPA tags plus untagged GM belt or crank starter-generator systems; rule,
+# overrides and the older assist systems counted as full are in DATASET.md,
+# section 3. A robustness check drops those assist systems.
+#
+# DML and AIPW are rerun over five seeds; the seed sets the folds, CatBoost and so
+# the common support. The reported effect and CI are from seed 42, as in the main
+# analysis.
+
+# %%
+dscr, mdl = df_clean['eng_dscr'].fillna(''), df_clean['model']
+volt = df_clean['evMotor'].str.extract(r'(\d+)\s*V', expand=False).astype(float)
+mild = (dscr.str.contains('Mild Hybrid|eAssist|eTorque') | mdl.str.contains('eAssist')
+        | (volt <= 48)
+        | (mdl.str.contains('15 Hybrid') & ~df_clean['year'].between(2009, 2013))  # 2009-13: two-mode full HEV
+        | mdl.isin(['Vue Hybrid', 'Aura Hybrid']))   # BAS; evMotor often missing
+mild &= ~mdl.str.contains('UX 250h|Maverick')   # full HEVs: wrong "Mild" tag, 48V/84V evMotor typos
+hyb_type = np.select([T == 0, mild.values], ['gas', 'mild'], 'full')
+print(pd.Series(hyb_type).value_counts().to_string())
+
+SEEDS = [42, 123, 456, 789, 2024]
+
+
+def overlap_sample(m, seed=42):
+    """Cluster ids, PS and common-support mask for the rows selected by m."""
+    clu = pd.factorize(df_clean.loc[m, 'cluster_key'])[0]
+    p = crossfit_ps(Xd[m], T[m], clu, seed)
+    lo, hi = common_support(p, T[m])
+    return clu, p, (p >= lo) & (p <= hi)
+
+
+def split_estimates(kind):
+    """One hybrid type vs gasoline: DML and AIPW per seed, within-model twins, and
+    the first seed's overlap sample for reuse in section 26."""
+    m = np.isin(hyb_type, ['gas', kind])
+    X, t, y = Xd[m], T[m], Y[m]
+    rows = []
+    for s in SEEDS:
+        clu, p, o = overlap_sample(m, s)
+        if s == SEEDS[0]:
+            support = (clu, p, o)
+        to, yo, po = t[o], y[o], p[o]
+        th, se = dml_estimate(X[o], to.astype(float), yo, clu[o], seed=s)
+        a, sa, _ = crossfit_aipw(X[o], to, yo, clu[o], seed=s)
+        rows.append({
+            'seed': s, 'n_hybrid': to.sum(), 'n_gas': (to == 0).sum(),
+            'dml': th, 'dml_se': se, 'dml_pct': th / control_mean(po, yo, to) * 100,
+            'aipw': a, 'aipw_se': sa,
+            'aipw_pct': a / control_mean(1 / (1 - np.clip(po, eps, 1 - eps)), yo, to) * 100,
+        })
+    pairs = within_model_pairs(df_clean[m & (T == 1)], df_clean[m & (T == 0)])
+    return pd.DataFrame(rows), pairs, support
+
+
+split = {k: split_estimates(k) for k in ['full', 'mild']}
+
+summary = []
+for kind, (r, pr, _) in split.items():
+    print(f"\n{kind} vs gasoline, per seed:")
+    print(r.round(3).to_string(index=False))
+    r0 = r.set_index('seed').loc[SEEDS[0]]
+    for est in ['dml', 'aipw']:
+        summary.append({'type': kind, 'estimator': est.upper(), 'n_hybrid': r0['n_hybrid'],
+                        'effect': r0[est],
+                        'CI_low': r0[est] - 1.96 * r0[f'{est}_se'],
+                        'CI_high': r0[est] + 1.96 * r0[f'{est}_se'],
+                        'pct_fuel': r0[f'{est}_pct'],
+                        'seed_min': r[est].min(), 'seed_max': r[est].max()})
+    ci = cluster_boot_ci(pd.factorize(pr['cluster_key'])[0],
+                         lambda rows: pr['gp_diff'].values[rows].mean())
+    summary.append({'type': kind, 'estimator': f"Twins ({pr['cluster_key'].nunique()} nameplates)",
+                    'n_hybrid': len(pr),
+                    'effect': pr['gp_diff'].mean(), 'CI_low': ci[0], 'CI_high': ci[1],
+                    'pct_fuel': pr['gp_diff'].mean() / pr['gp_gas'].mean() * 100})
+    # Per-nameplate saving, > 0 = hybrid saves fuel.
+    b = rosenbaum_bounds(-pr.groupby('cluster_key')['gp_diff'].mean().values, gammas)
+    print("  Twins Rosenbaum p_upper: "
+          + ", ".join(f"Gamma {g:g}: {p:.3f}" for g, p in zip(b['Gamma'], b['p_upper'])))
+summary = pd.DataFrame(summary)
+
+print("\nFull vs mild hybrids (gal/100mi; seed-42 estimate and CI, range over 5 seeds):")
+print(summary.round(2).to_string(index=False))
+
+# Robustness: drop the older assist systems counted as full (Honda/Acura IMA,
+# Mercedes S400/E400, BMW ActiveHybrid 7). Year caps keep the later two-motor or
+# high-voltage Insight, Accord Hybrid and ActiveHybrid 7 in.
+yr = df_clean['year']
+assist = ((mdl.str.contains('Insight|Civic Hybrid|CR-Z|ILX Hybrid') & (yr <= 2016))
+          | (mdl.str.startswith('Accord Hybrid') & (yr <= 2007))
+          | mdl.str.contains('S400 Hybrid|E400 Hybrid')
+          | (mdl.str.startswith('ActiveHybrid 7') & (yr <= 2012))).values & (hyb_type == 'full')
+m_a = np.isin(hyb_type, ['gas', 'full']) & ~assist
+clu_a, _, o_a = overlap_sample(m_a)
+th_a, se_a = dml_estimate(Xd[m_a][o_a], T[m_a][o_a].astype(float), Y[m_a][o_a], clu_a[o_a])
+print(f"\nFull HEV without {assist.sum()} assist-system rows: DML {th_a:+.3f} (SE {se_a:.3f}), "
+      f"vs {split['full'][0].set_index('seed').loc[SEEDS[0], 'dml']:+.3f} with them (same seed)")
+
+# %%
+# Rows in each group: DML, AIPW, Twins.
+bars = {'All hybrids (pooled)': (GREY, [(ate_dml, *ci_dml), (ate_aipw, *ci_aipw),
+                                        (ate_within, *ci_within)])}
+for kind, label, color in [('full', 'Full HEV', GREEN), ('mild', 'Mild hybrid', BLUE)]:
+    rows = summary[summary['type'] == kind][['effect', 'CI_low', 'CI_high']]
+    bars[label] = (color, list(rows.itertuples(index=False, name=None)))
+fig, ax = plt.subplots(figsize=(10, 5))
+for j, (label, (color, vals)) in enumerate(bars.items()):
+    yp = np.arange(3) + (j - 1) * 0.27
+    ax.barh(yp, [v[0] for v in vals], height=0.25, color=color, alpha=0.85,
+            edgecolor='white', label=label)
+    for y_, (e, lo, hi) in zip(yp, vals):
+        ax.plot([lo, hi], [y_, y_], color='black', linewidth=1.2)
+        ax.text(lo - 0.03, y_, f"{e:+.2f}", va='center', ha='right', fontsize=8)
+ax.set_yticks(range(3))
+ax.set_yticklabels(['DML', 'AIPW', 'Twins'])
+ax.invert_yaxis()
+ax.set_xlim(summary['CI_low'].min() - 0.3, 0.05)
+ax.axvline(0, color='gray', alpha=0.3)
+ax.set_xlabel('Effect on fuel use (gal/100mi) - more negative = larger saving')
+ax.set_title(f'Full HEVs vs mild hybrids, each against gasoline (EPA {YR})',
+             fontsize=12, fontweight='bold')
+ax.legend(fontsize=9, loc='lower left')
+plt.tight_layout()
+plt.savefig('08_full_vs_mild.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# %% [markdown]
+# ## 26. Sensitivity of the full-HEV estimate
+#
+# Three checks on the full-HEV estimate:
+# - **Omitted-variable bounds** (Chernozhukov et al. 2022, built into DoubleML), on
+#   a DoubleML PLR refit of the DML model. RV / RVa: the confounder strength
+#   (cf_y = cf_d, rho = 1) that erases the effect / its 95% significance. Unlike the
+#   E-value of section 22, they need no risk-ratio approximation. Benchmarks
+#   measure each covariate set's strength given the other covariates.
+# - **Propensity trimming**: the min/max common-support rule depends on a few extreme
+#   scores (the gasoline count moves by thousands across seeds), so DML and AIPW are
+#   rerun with fixed trims. Each trim changes the target population.
+# - **Negative control** (passenger volume, as in section 21) by hybrid type, and
+#   how much the full-HEV estimate moves when passenger volume is added to X.
+
+# %%
+m_f = np.isin(hyb_type, ['gas', 'full'])
+clu_f, ps_f, o_f = split['full'][2]
+X_f, T_f, Y_f = Xd[m_f], T[m_f], Y[m_f]
+
+# Refit in DoubleML only for its sensitivity tools; same sample and learners as
+# dml_estimate. np.random.seed fixes DoubleML's fold splits.
+np.random.seed(42)
+d_f = pd.DataFrame(X_f[o_f], columns=feat_names).assign(y=Y_f[o_f], t=T_f[o_f], c=clu_f[o_f])
+plr = DoubleMLPLR(DoubleMLClusterData(d_f, y_col='y', d_cols='t', x_cols=feat_names,
+                                      cluster_cols='c'),
+                  ml_l=cb_reg(iters=300), ml_m=cb_reg(iters=300), n_folds=5)
+plr.fit()
+plr.sensitivity_analysis()
+print(f"DoubleML PLR, full HEV: {plr.coef[0]:+.3f} gal/100mi (SE {plr.se[0]:.3f})")
+print(f"  RV = {plr.sensitivity_params['rv'][0]:.0%}, RVa = {plr.sensitivity_params['rva'][0]:.0%} (rho = 1)")
+for name, cols in [('displacement', ['displ']), ('model year', ['year']),
+                   ('engine block', ['displ', 'cylinders', 'turbo'])]:
+    bench = plr.sensitivity_benchmark(benchmarking_set=cols).iloc[0]
+    print(f"  Confounder as strong as {name}: cf_y = {bench['cf_y']:.3f}, cf_d = {bench['cf_d']:.3f}")
+    if bench['cf_y'] >= 1:   # explains all outcome residual variance: no finite bound
+        print("    no finite bound")
+        continue
+    for rho in [bench['rho'], 1.0]:   # the benchmark's own rho, then the worst case
+        plr.sensitivity_analysis(cf_y=bench['cf_y'], cf_d=bench['cf_d'], rho=rho)
+        sp = plr.sensitivity_params
+        print(f"    rho = {rho:+.2f}: [{sp['theta']['lower'][0]:+.3f}, {sp['theta']['upper'][0]:+.3f}], "
+              f"95% bound [{sp['ci']['lower'][0]:+.3f}, {sp['ci']['upper'][0]:+.3f}]")
+
+print("\nDML and AIPW under alternative propensity trims (full HEV):")
+for name, keep in [('min/max common support', o_f),
+                   ('0.01 < e < 0.99', (ps_f > 0.01) & (ps_f < 0.99)),
+                   ('0.05 < e < 0.95', (ps_f > 0.05) & (ps_f < 0.95)),
+                   ('0.1 < e < 0.9 (Crump)', (ps_f > 0.1) & (ps_f < 0.9))]:
+    th, se_th = dml_estimate(X_f[keep], T_f[keep].astype(float), Y_f[keep], clu_f[keep])
+    a, se_a, _ = crossfit_aipw(X_f[keep], T_f[keep], Y_f[keep], clu_f[keep])
+    print(f"  {name:24s} {T_f[keep].sum():4d} hybrids, {(T_f[keep] == 0).sum():6,d} gasoline: "
+          f"DML {th:+.3f} (SE {se_th:.3f}), AIPW {a:+.3f} (SE {se_a:.3f})")
+
+print("\nNegative control (pv4 > 0 only; 0 means not recorded):")
+for kind in ['full', 'mild']:
+    m = np.isin(hyb_type, ['gas', kind])
+    clu, _, o = split[kind][2]
+    k = o & (pv4[m] > 0)
+    th, se = dml_estimate(Xd[m][k], T[m][k].astype(float), pv4[m][k], clu[k])
+    print(f"  {kind}: {T[m][k].sum()} hybrids, {th:+.2f} cu ft (SE {se:.2f}, z = {th/se:+.1f})")
+
+k_f = o_f & (pv4[m_f] > 0)
+th_x, _ = dml_estimate(X_f[k_f], T_f[k_f].astype(float), Y_f[k_f], clu_f[k_f])
+th_pv, se_pv = dml_estimate(np.column_stack([X_f[k_f], pv4[m_f][k_f]]), T_f[k_f].astype(float),
+                            Y_f[k_f], clu_f[k_f])
+print(f"  Full-HEV fuel effect on the pv4 sample: {th_x:+.3f} with X, "
+      f"{th_pv:+.3f} (SE {se_pv:.3f}) with X + pv4")
+
+# %% [markdown]
 # ## Key takeaways
 #
 # 1. **Measure fuel, not MPG.** In MPG the naive gap is +8.8 MPG (+42%). MPG is the
@@ -1144,7 +1355,7 @@ plt.show()
 # 6. **Robustness.** Within-model matching (same nameplate, drive, model year and
 #    induction) agrees in sign and rough size with the model-based estimators, but
 #    covers only 373 hybrids from 53 nameplates. Its per-nameplate Rosenbaum bound
-#    stays significant up to Gamma = 10. Placebo, random-common-cause and subset
+#    stays significant at Gamma = 10, not at 15. Placebo, random-common-cause and subset
 #    checks pass. The negative control fails: hybrids show +1.5 cu ft passenger
 #    volume (z = 3.5), so some residual body/packaging confounding is possible.
 #
@@ -1152,5 +1363,12 @@ plt.show()
 #    effect is -0.71 to -1.03 gal/100mi; on an older MY2015 snapshot it was about
 #    -1.1 to -1.2. Two reasons: (a) the modern fleet is more efficient, so absolute
 #    gaps shrink, and (b) 43% of hybrid rows are tagged "Mild Hybrid" in `eng_dscr`.
-#    Mild hybrids save far less fuel and dilute the treatment. Splitting full vs
-#    mild hybrids is left as future work.
+#    Mild hybrids save far less fuel and dilute the treatment (takeaway 8).
+#
+# 8. **Full and mild hybrids are different products.** Full HEVs use 23-25% less
+#    fuel (DML -0.98 to -1.03, AIPW -1.11 to -1.16 gal/100mi over five seeds; twins
+#    -1.09, -27%); mild hybrids ~9-13% (-0.44 to -0.65). At rho = 1, a confounder
+#    as strong as displacement or model year (each given the other covariates)
+#    leaves the 95% bound below zero; one as strong as the whole engine block has no
+#    finite bound. The passenger-volume negative control fails; the twins hold the
+#    nameplate fixed, which removes most body differences (section 26).

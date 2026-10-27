@@ -37,7 +37,7 @@ Fields used in the analysis:
 | `model` | Nameplate key for clustering and within-model twins |
 | `co2TailpipeGpm` | Tailpipe CO2, secondary outcome |
 | `pv4` | 4-door passenger volume (cu ft), negative-control outcome |
-| `eng_dscr` | Engine description; marks mild hybrids |
+| `eng_dscr`, `evMotor` | Engine description and hybrid battery; used to split full vs mild hybrids |
 
 ## 3. Treatment and control definitions
 
@@ -45,7 +45,15 @@ Analysis window MY1998-2026 (33,555 rows).
 
 - **Treatment (n=1,790)**: `atvType == 'Hybrid'`, non-plug-in. Across all years the
   1,820 hybrid rows run on premium (917), regular (885) or midgrade (18) gasoline.
-  766 of the 1,790 (43%) are tagged "Mild Hybrid" in `eng_dscr`.
+  765 of the 1,790 (43%) are tagged "Mild Hybrid" in `eng_dscr`.
+- **Full vs mild split** (section 25): mild = `eng_dscr` tag `Mild Hybrid` /
+  `eAssist` / `eTorque`, `eAssist` in `model`, `evMotor` of 48V or less, GM
+  Silverado/Sierra "15 Hybrid" outside MY2009-2013 (PHT, Parallel Hybrid Truck;
+  eAssist) and Saturn Vue/Aura Hybrid (BAS, Belt Alternator Starter). Overrides: Lexus UX 250h (tagged "Mild", a full HEV) and
+  Ford Maverick (rows list 48V and 84V, other years 216-234V) count as full. Everything
+  else is a full HEV, including older 60-160V assist systems (Honda/Acura IMA,
+  Mercedes S400/E400, BMW ActiveHybrid 7 of 2011-12). `evMotor` voltage alone does not separate the two: it is
+  missing for 252 hybrid rows and has typos.
 - **Control (n=27,722)**: `fuelType1` in {Regular, Premium, Midgrade Gasoline} and
   `atvType` is NaN.
 - **Excluded in the window**: FFV 1,538, EV 1,437, Diesel 499, PHEV 442, CNG 47,
@@ -55,8 +63,8 @@ Analysis window MY1998-2026 (33,555 rows).
 vehicles carry NaN there. The control filter also requires gasoline `fuelType1`.
 
 After dropping rows with missing confounders and exact-duplicate specs, the
-analysis sample has 28,764 rows (26,991 gasoline, 1,773 hybrid) in 2,724
-make + base-model clusters.
+analysis sample has 28,764 rows (26,991 gasoline, 1,773 hybrid: 958 full, 815
+mild) in 2,724 make + base-model clusters.
 
 ## 4. Verification performed
 
